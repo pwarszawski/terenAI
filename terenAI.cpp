@@ -20,7 +20,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
 #include <vector>
@@ -52,7 +51,7 @@ namespace fs = std::filesystem;
 // Konfiguracja i struktury danych
 // -----------------------------------------------------------
 
-const std::string PROG_VERSION = "v262 (Smooth Shading)";
+const std::string PROG_VERSION = "v263 (Track Offset Param)";
 
 struct GlobalConfig {
     double OffsetEast = 0.0;
@@ -65,6 +64,7 @@ struct GlobalConfig {
     float SnapDist = 4.5f;          
     float SmoothEnd = 15.0f;        
     float MaxTriangleEdge = 800.0f; 
+    float TrackOffset = 0.6f; // NOWOŚĆ: Obniżenie terenu względem osi toru
     
     // Parametry nasypów
     float EmbankmentWidth = 2.60f; 
@@ -365,6 +365,7 @@ void LoadIniConfig(const std::string& filename) {
             else if (key == "SnapDist") g_Config.SnapDist = std::stof(val);
             else if (key == "SmoothDist") g_Config.SmoothEnd = std::stof(val);
             else if (key == "MaxTriangleEdge") g_Config.MaxTriangleEdge = std::stof(val);
+            else if (key == "TrackOffset") g_Config.TrackOffset = std::stof(val); // Wczytanie nowego parametru
             else if (key == "EmbankmentWidth") g_Config.EmbankmentWidth = std::stof(val);
             else if (key == "EmbankmentStep") g_Config.EmbankmentStep = std::stof(val);
             else if (key == "MinPointDist") g_Config.MinPointDist = std::stof(val);
@@ -579,7 +580,8 @@ void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vect
     for (const auto& p : points) pGrid.Add(p.pos);
 
     std::vector<TerrainPoint> newPoints;
-    const float OFFSET_Y = 0.6f;
+    // Zastosowanie parametru konfiguracyjnego zamiast wartości na sztywno
+    const float OFFSET_Y = g_Config.TrackOffset;
     const float OFFSET_XZ = g_Config.EmbankmentWidth;
     const float MIN_DIST = g_Config.MinPointDist;
 
@@ -605,7 +607,7 @@ void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vect
             
             Vector3 centerPos = t.p1 + dirNorm * d;
             float trackHeight = MathUtils::Lerp(t.p1.y, t.p2.y, d/len);
-            float terrainHeight = trackHeight - OFFSET_Y;
+            float terrainHeight = trackHeight - OFFSET_Y; // Zastosowano OFFSET_Y
 
             Vector3 leftPos = centerPos + perp * OFFSET_XZ;
             leftPos.y = terrainHeight;
@@ -643,7 +645,8 @@ void ProcessTerrain(std::vector<TerrainPoint>& points, const std::vector<TrackSe
     const float LIMIT_NMT100_MAX = g_Config.LimitNMT100Max;
     const float SNAP_DIST = g_Config.SnapDist; 
     const float SMOOTH_END = g_Config.SmoothEnd;
-    const float TRACK_OFFSET = 0.6f;
+    // Zastosowanie parametru konfiguracyjnego zamiast wartości na sztywno
+    const float TRACK_OFFSET = g_Config.TrackOffset;
 
     unsigned int threads = GetThreadCount();
     if (threads > 1) threads -= 1;
@@ -685,7 +688,7 @@ void ProcessTerrain(std::vector<TerrainPoint>& points, const std::vector<TrackSe
                 if (d <= SMOOTH_END) {
                     float weight = (1.0f - (d / SMOOTH_END));
                     weight = weight * weight; 
-                    float targetForThisTrack = trkY - TRACK_OFFSET;
+                    float targetForThisTrack = trkY - TRACK_OFFSET; // Zastosowano TRACK_OFFSET
                     sumWeightedHeights += targetForThisTrack * weight;
                     sumWeights += weight;
                 }
