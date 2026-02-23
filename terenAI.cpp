@@ -51,7 +51,7 @@ namespace fs = std::filesystem;
 // Konfiguracja i struktury danych
 // -----------------------------------------------------------
 
-const std::string PROG_VERSION = "v263 (Track Offset Param)";
+const std::string PROG_VERSION = "v263";
 
 struct GlobalConfig {
     double OffsetEast = 0.0;
@@ -882,8 +882,8 @@ void ParseArgs(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     std::locale::global(std::locale("C"));
-    LoadIniConfig("terenEU.ini");
-    std::cout << "--- terenAI " << PROG_VERSION << " ===" << std::endl;
+    LoadIniConfig("terenAI.ini");
+    std::cout << "--- terenAI " << PROG_VERSION << " --- " << std::endl;
     ParseArgs(argc, argv);
     ParseSCNOffsets(g_Config.FileSCN);
     PrintConfig();
