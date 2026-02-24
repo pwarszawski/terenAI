@@ -1,24 +1,7 @@
 // Ten plik zawiera kod na licencji MIT - delaunator.hpp
 // 
 // Copyright (c) 2018 Volodymyr Bilonenko
-// 
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-// 
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-// 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// ... (licencja MIT) ...
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
@@ -39,6 +22,7 @@
 #include <cstring>
 #include <set>
 #include <ctime>
+#include <cstdint> // Dodane dla typow binarnych uint32_t
 
 // -----------------------------------------------------------
 // Plik delaunator.hpp musi być w katalogu projektu
@@ -51,7 +35,7 @@ namespace fs = std::filesystem;
 // Konfiguracja i struktury danych
 // -----------------------------------------------------------
 
-const std::string PROG_VERSION = "v265";
+const std::string PROG_VERSION = "v266 (E3D+SCM)";
 
 struct GlobalConfig {
     double OffsetEast = 0.0;
@@ -72,17 +56,16 @@ struct GlobalConfig {
     float MinPointDist = 1.0f;     
     float MergeClosePoints = 0.15f; 
 
-    // Nazwy plików i katalogów wejściowych
+    // Nazwy plików i katalogów
     std::string DirNMT1 = "NMT1";
     std::string FileNMT100 = "NMT100.txt";
     std::string FileSCN = "EXPORT.SCN";
-
-    // Opcje eksportu
-    bool ExportSCM = true;
-    std::string FileOutputSCM = "teren.scm";
     
+    // Ustawienia Eksportu (z pliku .ini)
+    bool ExportSCM = true;
+    std::string OutputSCM = "teren.scm";
     bool ExportE3D = false;
-    std::string FileOutputE3D = "teren.e3d";
+    std::string OutputE3D = "teren.e3d";
 
     int CpuUsagePercent = 80;
     int ProgressMode = 2; 
@@ -96,7 +79,6 @@ struct Vector3 {
     Vector3 operator*(float scalar) const { return {x * scalar, y * scalar, z * scalar}; }
     Vector3 operator/(float scalar) const { return {x / scalar, y / scalar, z / scalar}; }
     
-    // Akumulacja normalnych
     Vector3& operator+=(const Vector3& other) {
         x += other.x; y += other.y; z += other.z;
         return *this;
@@ -121,12 +103,11 @@ struct Vector3 {
 
 struct TerrainPoint {
     Vector3 pos;
-    Vector3 normal; // Wektor normalny wierzchołka (Smooth Shading)
+    Vector3 normal; 
     bool isNMT1;
     bool isValid;
     bool isFixed; 
     
-    // Konstruktor domyślny zerujący normalną
     TerrainPoint() : pos{0,0,0}, normal{0,0,0}, isNMT1(false), isValid(true), isFixed(false) {}
     TerrainPoint(Vector3 p, bool nmt1, bool valid, bool fixed) 
         : pos(p), normal{0,0,0}, isNMT1(nmt1), isValid(valid), isFixed(fixed) {}
@@ -147,6 +128,40 @@ struct TrackSegment {
 struct TriangleSortInfo {
     size_t v1, v2, v3;
     float cx, cz;
+};
+
+// -----------------------------------------------------------
+// Pomocnicza klasa dla formatu E3D (Zapis binarny wg specyfikacji MaSzyny)
+// -----------------------------------------------------------
+struct E3DChunkWriter {
+    std::vector<uint8_t> data;
+
+    void writeID(const char* id) { data.insert(data.end(), id, id + 4); }
+    
+    void writeU32(uint32_t val) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(&val);
+        data.insert(data.end(), p, p + 4);
+    }
+    
+    void writeI32(int32_t val) { writeU32(static_cast<uint32_t>(val)); }
+    
+    void writeF32(float val) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(&val);
+        data.insert(data.end(), p, p + 4);
+    }
+    
+    void writeZeroes(size_t count) { data.insert(data.end(), count, 0); }
+    
+    // Wyrównanie do wielokrotności 4 bajtów
+    void pad() { while (data.size() % 4 != 0) data.push_back(0); }
+    
+    // Zapisuje wielkość kromki do odpowiedniego miejsca
+    void finalizeLength() {
+        if (data.size() >= 8) {
+            uint32_t size = static_cast<uint32_t>(data.size());
+            std::memcpy(&data[4], &size, 4);
+        }
+    }
 };
 
 // -----------------------------------------------------------
@@ -349,9 +364,13 @@ public:
 
 void LoadIniConfig(const std::string& filename) {
     if (!fs::exists(filename)) {
-        std::cerr << "BLAD: Brak pliku konfiguracyjnego: " << filename << std::endl;
-        exit(1);
+        std::cerr << "========================================================\n";
+        std::cerr << " BLAD KRYTYCZNY: Brak pliku konfiguracyjnego '.ini'!\n";
+        std::cerr << " Utworz plik '" << filename << "' w folderze z programem.\n";
+        std::cerr << "========================================================\n";
+        exit(1); // Wymóg posiadania INI - program zamknie się natychmiast
     }
+    
     std::ifstream file(filename);
     std::string line;
     while (std::getline(file, line)) {
@@ -359,16 +378,21 @@ void LoadIniConfig(const std::string& filename) {
         if (line.empty() || line[0] == ';' || line[0] == '#' || line[0] == '[') continue;
         size_t eqPos = line.find('=');
         if (eqPos == std::string::npos) continue;
+        
         std::string key = Trim(line.substr(0, eqPos));
         std::string val = Trim(line.substr(eqPos + 1));
+        
         try {
             if (key == "FileSCN") g_Config.FileSCN = val;
             else if (key == "DirNMT1") g_Config.DirNMT1 = val;
             else if (key == "FileNMT100") g_Config.FileNMT100 = val;
-            else if (key == "OutputSCM") { g_Config.FileOutputSCM = val; }
-            else if (key == "ExportSCM") { g_Config.ExportSCM = (val == "1" || val == "true" || val == "TRUE"); }
-            else if (key == "OutputE3D") { g_Config.FileOutputE3D = val; }
-            else if (key == "ExportE3D") { g_Config.ExportE3D = (val == "1" || val == "true" || val == "TRUE"); }
+            
+            // Nowe tagi dla formatów Exportu
+            else if (key == "ExportSCM") g_Config.ExportSCM = (val == "1" || val == "true" || val == "TRUE");
+            else if (key == "OutputSCM" || key == "Output") g_Config.OutputSCM = val;
+            else if (key == "ExportE3D") g_Config.ExportE3D = (val == "1" || val == "true" || val == "TRUE");
+            else if (key == "OutputE3D") g_Config.OutputE3D = val;
+            
             else if (key == "LimitNMT1") g_Config.LimitNMT1 = std::stof(val);
             else if (key == "LimitNMT100") g_Config.LimitNMT100Max = std::stof(val);
             else if (key == "SnapDist") g_Config.SnapDist = std::stof(val);
@@ -381,9 +405,30 @@ void LoadIniConfig(const std::string& filename) {
             else if (key == "MergeClosePoints") g_Config.MergeClosePoints = std::stof(val);
             else if (key == "CpuUsagePercent") g_Config.CpuUsagePercent = std::stoi(val);
             else if (key == "ProgressMode") g_Config.ProgressMode = std::stoi(val);
-            else if (key == "SwapNMT100Axes") g_Config.SwapNMT100Axes = (std::stoi(val) != 0);
+            else if (key == "SwapNMT100Axes") g_Config.SwapNMT100Axes = (val == "1" || val == "true" || val == "TRUE");
         } catch (...) {}
     }
+}
+
+void PrintConfig() {
+    std::cout << "\n========================================" << std::endl;
+    std::cout << " Wczytana konfiguracja (z pliku .ini):" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << " [WEJSCIE]" << std::endl;
+    std::cout << "  Plik torow SCN : " << g_Config.FileSCN << std::endl;
+    std::cout << "  Katalog NMT1   : " << g_Config.DirNMT1 << std::endl;
+    std::cout << "  Plik NMT100    : " << g_Config.FileNMT100 << std::endl;
+    std::cout << "\n [EKSPORT]" << std::endl;
+    std::cout << "  Zapis do SCM   : " << (g_Config.ExportSCM ? "TAK -> " + g_Config.OutputSCM : "NIE") << std::endl;
+    std::cout << "  Zapis do E3D   : " << (g_Config.ExportE3D ? "TAK -> " + g_Config.OutputE3D : "NIE") << std::endl;
+    std::cout << "\n [PARAMETRY TERENU]" << std::endl;
+    std::cout << "  Limit NMT1     : " << g_Config.LimitNMT1 << " m" << std::endl;
+    std::cout << "  Limit NMT100   : " << g_Config.LimitNMT100Max << " m" << std::endl;
+    std::cout << "  Tolerancja Snap: " << g_Config.SnapDist << " m" << std::endl;
+    std::cout << "  Dystans Smooth : " << g_Config.SmoothEnd << " m" << std::endl;
+    std::cout << "  Max bok trojk. : " << g_Config.MaxTriangleEdge << " m" << std::endl;
+    std::cout << "  Obnizenie toru : " << g_Config.TrackOffset << " m" << std::endl;
+    std::cout << "========================================\n\n";
 }
 
 bool ParseSCNOffsets(const std::string& filename) {
@@ -579,7 +624,7 @@ void LoadNMT100_TXT(const std::string& filename, std::vector<TerrainPoint>& poin
 }
 
 // -----------------------------------------------------------
-// Generowanie punktów nasypów wzdłuż torów, z zachowaniem minimalnej odległości między punktami
+// Generowanie punktów nasypów wzdłuż torów
 // -----------------------------------------------------------
 
 void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vector<TerrainPoint>& points) {
@@ -589,7 +634,6 @@ void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vect
     for (const auto& p : points) pGrid.Add(p.pos);
 
     std::vector<TerrainPoint> newPoints;
-    // Zastosowanie parametru konfiguracyjnego zamiast wartości na sztywno
     const float OFFSET_Y = g_Config.TrackOffset;
     const float OFFSET_XZ = g_Config.EmbankmentWidth;
     const float MIN_DIST = g_Config.MinPointDist;
@@ -616,7 +660,7 @@ void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vect
             
             Vector3 centerPos = t.p1 + dirNorm * d;
             float trackHeight = MathUtils::Lerp(t.p1.y, t.p2.y, d/len);
-            float terrainHeight = trackHeight - OFFSET_Y; // Zastosowano OFFSET_Y
+            float terrainHeight = trackHeight - OFFSET_Y;
 
             Vector3 leftPos = centerPos + perp * OFFSET_XZ;
             leftPos.y = terrainHeight;
@@ -642,7 +686,7 @@ void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vect
 }
 
 // -----------------------------------------------------------
-// Przetwarzanie terenu - filtrowanie punktów, wygładzanie i oznaczanie ważności względem torów
+// Przetwarzanie terenu 
 // ----------------------------------------------------------
 
 void ProcessTerrain(std::vector<TerrainPoint>& points, const std::vector<TrackSegment>& tracks) {
@@ -654,7 +698,6 @@ void ProcessTerrain(std::vector<TerrainPoint>& points, const std::vector<TrackSe
     const float LIMIT_NMT100_MAX = g_Config.LimitNMT100Max;
     const float SNAP_DIST = g_Config.SnapDist; 
     const float SMOOTH_END = g_Config.SmoothEnd;
-    // Zastosowanie parametru konfiguracyjnego zamiast wartości na sztywno
     const float TRACK_OFFSET = g_Config.TrackOffset;
 
     unsigned int threads = GetThreadCount();
@@ -691,13 +734,12 @@ void ProcessTerrain(std::vector<TerrainPoint>& points, const std::vector<TrackSe
                 
                 if (d < absMinDist) absMinDist = d;
 
-                // Tunele i mosty nie wplywaja na wysokosc
                 if (trk->isTunnel || trk->isBridge) continue;
 
                 if (d <= SMOOTH_END) {
                     float weight = (1.0f - (d / SMOOTH_END));
                     weight = weight * weight; 
-                    float targetForThisTrack = trkY - TRACK_OFFSET; // Zastosowano TRACK_OFFSET
+                    float targetForThisTrack = trkY - TRACK_OFFSET; 
                     sumWeightedHeights += targetForThisTrack * weight;
                     sumWeights += weight;
                 }
@@ -771,7 +813,7 @@ void RemoveDuplicates(std::vector<TerrainPoint>& points) {
 }
 
 // -----------------------------------------------------------
-// Opcjonalny Eksport (SCM, E3D) z zachowaniem oryginalnej logiki
+// EKSPORT TERENU (SCM ORAZ E3D)
 // -----------------------------------------------------------
 
 void ExportTerrain(std::vector<TerrainPoint>& points) {
@@ -780,10 +822,7 @@ void ExportTerrain(std::vector<TerrainPoint>& points) {
     for (const auto& p : points) { coords.push_back(p.pos.x); coords.push_back(p.pos.z); }
     delaunator::Delaunator d(coords);
 
-    // KROK 1: Obliczanie normalnych wierzchołków (Smooth Shading)
     std::cout << "[GENEROWANIE] Obliczanie oswietlenia (Smooth Shading)..." << std::endl;
-    
-    // Reset normalnych
     for(auto& p : points) p.normal = {0,0,0};
 
     const float MAX_EDGE = g_Config.MaxTriangleEdge;
@@ -799,12 +838,10 @@ void ExportTerrain(std::vector<TerrainPoint>& points) {
         float d3 = std::sqrt(std::pow(p3.x-p1.x, 2) + std::pow(p3.z-p1.z, 2));
         if (d1 > MAX_EDGE || d2 > MAX_EDGE || d3 > MAX_EDGE) continue;
 
-        // Oblicz normalną ściany (ważoną polem powierzchni za pomocą iloczynu wektorowego)
         Vector3 U = p2 - p1;
         Vector3 V = p3 - p1;
-        Vector3 FaceNormal = U.Cross(V); // Nie normalizujemy tutaj! (Area Weighted)
+        Vector3 FaceNormal = U.Cross(V); 
 
-        // Dodaj do wierzchołków
         points[v1].normal += FaceNormal;
         points[v2].normal += FaceNormal;
         points[v3].normal += FaceNormal;
@@ -814,7 +851,6 @@ void ExportTerrain(std::vector<TerrainPoint>& points) {
         sortedTris.push_back(t);
     }
 
-    // Normalizacja wektorów wierzchołków
     for(auto& p : points) p.normal = p.normal.Normalized();
 
     std::cout << "[GENEROWANIE] Sortowanie trojkatow..." << std::endl;
@@ -826,16 +862,16 @@ void ExportTerrain(std::vector<TerrainPoint>& points) {
     auto now = std::chrono::system_clock::now();
     std::time_t now_c = std::chrono::system_clock::to_time_t(now);
 
-    // ==========================================
-    // EKSPORT SCM (Maszyna)
-    // ==========================================
+    // =====================================
+    // EKSPORT: Format .scm (Tekstowy)
+    // =====================================
     if (g_Config.ExportSCM) {
-        std::cout << "[ZAPISYWANIE] Plik SCM: " << g_Config.FileOutputSCM << "..." << std::endl;
-        std::ofstream out(g_Config.FileOutputSCM);
+        std::cout << "[EKSPORT SCM] Plik: " << g_Config.OutputSCM << "..." << std::endl;
+        std::ofstream out(g_Config.OutputSCM);
         out.imbue(std::locale("C"));
         out << std::fixed << std::setprecision(2);
 
-        out << "// Generated by TerenAI Generator " << PROG_VERSION << "\n";
+        out << "// Generated by TerenAI " << PROG_VERSION << "\n";
         out << "// Date: " << std::put_time(std::localtime(&now_c), "%Y-%m-%d %H:%M:%S") << "\n";
         out << "// Offset: East=" << g_Config.OffsetEast << ", North=" << g_Config.OffsetNorth << "\n\n";
 
@@ -846,7 +882,7 @@ void ExportTerrain(std::vector<TerrainPoint>& points) {
 
         for (size_t i = 0; i < sortedTris.size(); i += TRIANGLES_PER_NODE) {
             written += TRIANGLES_PER_NODE;
-            if (written % 10000 == 0) ShowProgress(written, totalTris, "[ZAPISYWANIE] Postep SCM");
+            if (written % 10000 == 0) ShowProgress(written, totalTris, "[EKSPORT SCM] Zapis");
 
             out << "node -1 0 teren_" << nodeCounter++ << " triangles grass\n";
             size_t batchEnd = std::min(i + TRIANGLES_PER_NODE, sortedTris.size());
@@ -871,63 +907,142 @@ void ExportTerrain(std::vector<TerrainPoint>& points) {
         }
         if (g_Config.ProgressMode != 0) std::cout << std::endl;
         out.close();
-        std::cout << " -> Zapisano " << nodeCounter << " node (SCM)." << std::endl;
+        std::cout << " -> Zapisano " << nodeCounter << " wezlow w SCM." << std::endl;
     }
 
-    // ==========================================
-    // EKSPORT E3D
-    // ==========================================
+    // =====================================
+    // EKSPORT: Format .e3d (Binarny)
+    // =====================================
     if (g_Config.ExportE3D) {
-        std::cout << "[ZAPISYWANIE] Plik E3D: " << g_Config.FileOutputE3D << "..." << std::endl;
-        std::ofstream e3d(g_Config.FileOutputE3D);
-        e3d.imbue(std::locale("C"));
-        e3d << std::fixed << std::setprecision(2);
+        std::cout << "[EKSPORT E3D] Plik: " << g_Config.OutputE3D << "..." << std::endl;
 
-        e3d << "// Generated by TerenAI " << PROG_VERSION << "\n";
-        e3d << "// Date: " << std::put_time(std::localtime(&now_c), "%Y-%m-%d %H:%M:%S") << "\n";
-        e3d << "// Offset: East=" << g_Config.OffsetEast << ", North=" << g_Config.OffsetNorth << "\n\n";
+        // --- KROMKA TEX0 ---
+        E3DChunkWriter tex0;
+        tex0.writeID("TEX0");
+        tex0.writeU32(0); // placeholder dla wielkości
+        tex0.data.push_back(0); // Element 0 nieużywany (wymóg dokumentacji)
+        std::string textureName = "grass";
+        tex0.data.insert(tex0.data.end(), textureName.begin(), textureName.end());
+        tex0.data.push_back(0); // Null-terminator dla "grass" (teraz grass ma indeks 1)
+        tex0.pad();
+        tex0.finalizeLength();
 
-        e3d << "[POINTS]\n";
-        e3d << points.size() << "\n";
+        // --- KROMKA NAM0 ---
+        E3DChunkWriter nam0;
+        nam0.writeID("NAM0");
+        nam0.writeU32(0);
+        std::string submodelName = "teren";
+        nam0.data.insert(nam0.data.end(), submodelName.begin(), submodelName.end());
+        nam0.data.push_back(0); // Null-terminator (teren ma indeks 0)
+        nam0.pad();
+        nam0.finalizeLength();
+
+        // --- KROMKA VNT0 ---
+        E3DChunkWriter vnt0;
+        vnt0.writeID("VNT0");
+        vnt0.writeU32(0);
         for (const auto& p : points) {
-            e3d << p.pos.x << " " << p.pos.y << " " << p.pos.z << "\n";
+            vnt0.writeF32(p.pos.x);
+            vnt0.writeF32(p.pos.y);
+            vnt0.writeF32(p.pos.z);
+            vnt0.writeF32(p.normal.x);
+            vnt0.writeF32(p.normal.y);
+            vnt0.writeF32(p.normal.z);
+            vnt0.writeF32(p.pos.x * 0.04f); // U
+            vnt0.writeF32(p.pos.z * 0.04f); // V
         }
+        vnt0.pad();
+        vnt0.finalizeLength();
 
-        e3d << "[FACES]\n";
-        e3d << sortedTris.size() << "\n";
+        // --- KROMKA IDX4 ---
+        E3DChunkWriter idx4;
+        idx4.writeID("IDX4");
+        idx4.writeU32(0);
         for (const auto& t : sortedTris) {
-            const auto& p1 = points[t.v1];
-            const auto& p2 = points[t.v2];
-            const auto& p3 = points[t.v3];
-
-            float u1 = p1.pos.x * 0.04f; float v1 = p1.pos.z * 0.04f;
-            float u2 = p2.pos.x * 0.04f; float v2 = p2.pos.z * 0.04f;
-            float u3 = p3.pos.x * 0.04f; float v3 = p3.pos.z * 0.04f;
-
-            // Zapis UV oraz domyślnej tekstury "grass"
-            e3d << t.v1 << " " << t.v2 << " " << t.v3 << " grass "
-                << u1 << " " << v1 << " "
-                << u2 << " " << v2 << " "
-                << u3 << " " << v3 << "\n";
+            idx4.writeU32(static_cast<uint32_t>(t.v1));
+            idx4.writeU32(static_cast<uint32_t>(t.v2));
+            idx4.writeU32(static_cast<uint32_t>(t.v3));
         }
-        e3d.close();
-        std::cout << " -> Zapisano " << sortedTris.size() << " trojkatow (E3D)." << std::endl;
+        idx4.pad();
+        idx4.finalizeLength();
+
+        // --- KROMKA SUB0 ---
+        E3DChunkWriter sub0;
+        sub0.writeID("SUB0");
+        sub0.writeU32(0); // 256 bajtow danych + 8 header = 264. To wypełni finalizeLength()
+        
+        // Zapisywanie 256-bajtowej struktury dla jednego ogromnego submodelu
+        sub0.writeI32(-1); // 0: Następny submodel (-1: brak)
+        sub0.writeI32(-1); // 4: Potomek (-1: brak)
+        sub0.writeI32(4);  // 8: Typ (4 = GL_TRIANGLES)
+        sub0.writeI32(0);  // 12: Nr nazwy (0 = wzkazuje na "teren" w NAM0)
+        sub0.writeI32(0);  // 16: Animacja (0 = false/nieruchomy)
+        sub0.writeI32(16); // 20: Flagi (Bit 4 ustawiony = render opaque)
+        sub0.writeI32(-1); // 24: Macierz przekształcenia (-1 = jednostkowa)
+        sub0.writeI32(static_cast<int32_t>(points.size())); // 28: Ilość wierzchołków
+        sub0.writeI32(0);  // 32: Pierwszy wierzchołek w VNT0
+        sub0.writeI32(1);  // 36: Numer materiału (1 = "grass" w TEX0)
+        sub0.writeF32(0.0f); // 40: Próg jasności
+        sub0.writeF32(0.0f); // 44: Próg zapalenia światła
+        
+        // 48: Kolor Ambient (16 bajtów)
+        sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0);
+        // 64: Kolor Diffuse (16 bajtów)
+        sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f);
+        // 80: Kolor Specular (16 bajtów)
+        sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0);
+        // 96: Kolor Emisji (16 bajtów)
+        sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0);
+        
+        sub0.writeF32(1.0f); // 112: Rozmiar linii
+        sub0.writeF32(100000000.0f); // 116: Kwadrat max. odległości widoczności
+        sub0.writeF32(0.0f); // 120: Kwadrat min. odległości widoczności
+        
+        // 124: Parametry światła (8 floatów = 32 bajty) - Zera
+        sub0.writeZeroes(32);
+        
+        // 156: Ilość indeksów trójkątów
+        sub0.writeI32(static_cast<int32_t>(sortedTris.size() * 3));
+        // 160: Pierwszy indeks
+        sub0.writeI32(0);
+        // 164: Mnożnik diffuse
+        sub0.writeF32(1.0f);
+        
+        // 168 do 255: Zmienne robocze - zera (88 bajtów)
+        sub0.writeZeroes(88);
+        
+        sub0.finalizeLength();
+
+        // --- KROMKA GŁÓWNA E3D0 ---
+        E3DChunkWriter e3d0;
+        e3d0.writeID("E3D0");
+        
+        uint32_t totalSize = 8 + 
+                             static_cast<uint32_t>(sub0.data.size() + 
+                                                   vnt0.data.size() + 
+                                                   idx4.data.size() + 
+                                                   tex0.data.size() + 
+                                                   nam0.data.size());
+        
+        e3d0.writeU32(totalSize);
+        e3d0.data.insert(e3d0.data.end(), sub0.data.begin(), sub0.data.end());
+        e3d0.data.insert(e3d0.data.end(), vnt0.data.begin(), vnt0.data.end());
+        e3d0.data.insert(e3d0.data.end(), idx4.data.begin(), idx4.data.end());
+        e3d0.data.insert(e3d0.data.end(), tex0.data.begin(), tex0.data.end());
+        e3d0.data.insert(e3d0.data.end(), nam0.data.begin(), nam0.data.end());
+
+        // Zapis na dysk
+        std::ofstream file(g_Config.OutputE3D, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(e3d0.data.data()), e3d0.data.size());
+        file.close();
+
+        std::cout << " -> Zapisano binarny plik E3D. Rozmiar: " << std::fixed << std::setprecision(1) << (e3d0.data.size() / 1024.0 / 1024.0) << " MB." << std::endl;
     }
 }
 
 // -----------------------------------------------------------
-// Główna funkcja
+// Main
 // -----------------------------------------------------------
-
-void PrintConfig() {
-    std::cout << "\n--- terenAI konfiguracja ---" << std::endl;
-    if (g_Config.OffsetsLoaded) std::cout << "  Offsety: OK (" << g_Config.OffsetEast << ", " << g_Config.OffsetNorth << ")" << std::endl;
-    else std::cout << "  Offsety: BRAK" << std::endl;
-    
-    std::cout << "  Eksport:" << std::endl;
-    if (g_Config.ExportSCM) std::cout << "    - SCM: " << g_Config.FileOutputSCM << std::endl;
-    if (g_Config.ExportE3D) std::cout << "    - E3D: " << g_Config.FileOutputE3D << std::endl;
-}
 
 void ParseArgs(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
@@ -938,14 +1053,16 @@ void ParseArgs(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     std::locale::global(std::locale("C"));
+    std::cout << "--- terenAI " << PROG_VERSION << " --- \n";
+    
     LoadIniConfig("terenAI.ini");
-    std::cout << "--- terenAI " << PROG_VERSION << " --- " << std::endl;
     ParseArgs(argc, argv);
     ParseSCNOffsets(g_Config.FileSCN);
     PrintConfig();
     
     if (!g_Config.ExportSCM && !g_Config.ExportE3D) {
-        std::cout << "\nUWAGA: Zarowno ExportSCM jak i ExportE3D sa wylaczone w terenAI.ini.\nProgram nie wygeneruje zadnego pliku wyjsciowego!\n";
+        std::cerr << "BLAD: Wszystkie opcje eksportu w terenAI.ini sa wylaczone (ExportSCM i ExportE3D).\n";
+        return 1;
     }
 
     if (!g_Config.OffsetsLoaded) {
@@ -964,7 +1081,9 @@ int main(int argc, char* argv[]) {
     GenerateEmbankmentPoints(tracks, points);
     RemoveDuplicates(points);
     ProcessTerrain(points, tracks);
-    ExportTerrain(points); // Zamieniono SaveSCM na ExportTerrain
+    
+    // Główne wywołanie nowej funkcji eksportującej
+    ExportTerrain(points);
     
     std::cout << "Gotowe." << std::endl;
     return 0;
