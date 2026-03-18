@@ -35,7 +35,7 @@ namespace fs = std::filesystem;
 // Konfiguracja i struktury danych
 // -----------------------------------------------------------
 
-const std::string PROG_VERSION = "v281";
+const std::string PROG_VERSION = "v283";
 
 struct GlobalConfig {
     double OffsetEast = 0.0;
@@ -473,7 +473,7 @@ void FlagGhostTracks(std::vector<TrackSegment>& tracks) {
             }
         }
     }
-    std::cout << " -> Oznaczono " << ghosts << " segmentow jako tory na wiaduktach (zostana zignorowane)." << std::endl;
+    std::cout << " -> Oznaczono " << ghosts << " segmentow jako tory na wiaduktach(zostana zignorowane)." << std::endl;
 }
 
 void LoadNMT1_Turbo(const std::string& folderPath, std::vector<TerrainPoint>& outPoints, const std::vector<TrackSegment>& tracks) {
@@ -585,10 +585,10 @@ void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vect
             Vector3 leftPos = centerPos + perp * OFFSET_XZ; leftPos.y = terrainHeight;
             Vector3 rightPos = centerPos - perp * OFFSET_XZ; rightPos.y = terrainHeight;
 
-            // Punkty nasypu NIE SA JUZ ZAMROZONE (ostatni argument = false)!
-            // Pozwala to na ich wyginanie i ksztaltowanie, jesli wpadna miedzy dwa tory.
-            if (!pGrid.HasNeighbor(leftPos, MIN_DIST)) { newPoints.push_back({leftPos, true, true, false}); pGrid.Add(leftPos); }
-            if (!pGrid.HasNeighbor(rightPos, MIN_DIST)) { newPoints.push_back({rightPos, true, true, false}); pGrid.Add(rightPos); }
+            // Czwarty argument to TRUE. Ramiona nasypu są znów nietykalne (isFixed)!
+            // Zapobiega to ich "topieniu się" i tworzeniu zapadlisk (bruzd) między torami.
+            if (!pGrid.HasNeighbor(leftPos, MIN_DIST)) { newPoints.push_back({leftPos, true, true, true}); pGrid.Add(leftPos); }
+            if (!pGrid.HasNeighbor(rightPos, MIN_DIST)) { newPoints.push_back({rightPos, true, true, true}); pGrid.Add(rightPos); }
         }
     }
     if(g_Config.ProgressMode != 0) std::cout << std::endl;
@@ -614,11 +614,20 @@ void ProcessTerrain(std::vector<TerrainPoint>& points, const std::vector<TrackSe
         
         for (size_t i = start; i < end; ++i) {
             TerrainPoint& pt = points[i];
+            
+            // Zapewnia to, że szerokość podkładów i tłucznia jest perfekcyjnie zachowana.
+            if (pt.isFixed) {
+                pt.isValid = true; // Ramiona nasypu zawsze są poprawne
+                processed++; 
+                continue;
+            }
+
             fineGrid.GetNearby(pt.pos, nearbyFine);
 
             float minDistBridge = 1e9f;
             const TrackSegment* nearestBridge = nullptr;
             float distToAnyTrack = 1e9f;
+            float minTrackDist = 1e9f;
 
             for (const auto* trk : nearbyFine) {
                 float dummyY;
@@ -630,58 +639,54 @@ void ProcessTerrain(std::vector<TerrainPoint>& points, const std::vector<TrackSe
                 }
             }
 
+            // Niszczenie śmieci laserowych na mostach (działa tylko dla punktów niezablokowanych)
             bool killPoint = false;
-
-            if (nearestBridge != nullptr && minDistBridge <= 12.0f && pt.isNMT1 && !pt.isFixed) {
+            if (nearestBridge != nullptr && minDistBridge <= 12.0f && pt.isNMT1) {
                 float bY; MathUtils::GetDistanceToSegment(pt.pos, *nearestBridge, bY);
                 if (pt.pos.y > bY - 2.5f) { killPoint = true; }
             }
 
             if (killPoint) { pt.isValid = false; processed++; continue; }
             
-            // KROK 2: Inverse Distance Weighting & Zsumowany Wpływ
+            // ZMIANA v283: Sześcienne blendowanie IDW (tylko dla naturalnych punktów terenu NMT)
             float sumWeightedHeights = 0.0f;
             float sumWeights = 0.0f;
-            float totalInfluence = 0.0f;
 
             for (const auto* trk : nearbyFine) {
                 if (trk->isBridge || trk->isTunnel || trk->isGhost) continue; 
                 
                 float trkY; 
                 float d = MathUtils::GetDistanceToSegment(pt.pos, *trk, trkY);
+                if (d < minTrackDist) minTrackDist = d;
                 
                 if (d <= SMOOTH_END) {
                     float currentOffset = g_Config.TrackOffset;
                     if (trk->isPlatform) currentOffset += g_Config.PlatformExtraOffset;
                     float targetH = trkY - currentOffset;
 
-                    // Waga do blendowania wysokosci (potęga 4 mocno trzyma plaski teren bezposrednio przy torze)
-                    float d_clamped = std::max(0.5f, d); 
-                    float weight = 1.0f / (d_clamped * d_clamped * d_clamped * d_clamped);
+                    // Kubiczna matematyka zapewnia, że punkt NMT błyskawicznie "łapie" wysokość 
+                    // najbliższego toru, a nie tego w oddali.
+                    float d_clamped = std::max(0.1f, d); 
+                    float weight = 1.0f / (d_clamped * d_clamped * d_clamped);
                     
                     sumWeightedHeights += targetH * weight;
                     sumWeights += weight;
-
-                    // Obliczenie wpływu by wiedziec czy ignorujemy "naturalny" NMT
-                    float influence = 1.0f;
-                    if (d > SNAP_DIST) {
-                        float t = 1.0f - ((d - SNAP_DIST) / (SMOOTH_END - SNAP_DIST));
-                        influence = t * t * (3.0f - 2.0f * t); // Smoothstep
-                    }
-                    totalInfluence += influence;
                 }
             }
 
-            if (sumWeights > 0.0000001f) {
-                // Obliczamy najodpowiedniejsza wysokosc oparta o uklad torow
+            if (sumWeights > 0.0000001f && minTrackDist <= SMOOTH_END) {
                 float blendedTargetH = sumWeightedHeights / sumWeights;
                 
-                // Jesli suma wplywu >= 1.0 (np. srodek miedzy bliskimi torami), tory rzadza.
-                float trackDominance = std::min(1.0f, totalInfluence);
-                pt.pos.y = MathUtils::Lerp(pt.pos.y, blendedTargetH, trackDominance);
+                float blendFactor = 1.0f; 
+                if (minTrackDist > SNAP_DIST) {
+                    float t = (minTrackDist - SNAP_DIST) / (SMOOTH_END - SNAP_DIST);
+                    blendFactor = 1.0f - (t * t * (3.0f - 2.0f * t)); 
+                }
+                
+                pt.pos.y = MathUtils::Lerp(pt.pos.y, blendedTargetH, blendFactor);
             }
 
-            // Krok 3: Limitowanie odleglosciowe widocznosci 
+            // Limitowanie odległościowe
             if (pt.isNMT1) { pt.isValid = (distToAnyTrack <= LIMIT_NMT1); } 
             else { 
                 if (distToAnyTrack <= LIMIT_NMT1) pt.isValid = false;
@@ -728,7 +733,7 @@ void ExportTerrain(std::vector<TerrainPoint>& points) {
     for (const auto& p : points) { coords.push_back(p.pos.x); coords.push_back(p.pos.z); }
     delaunator::Delaunator d(coords);
 
-    std::cout << "[GENEROWANIE] Obliczanie oswietlenia (Smooth Shading)..." << std::endl;
+    std::cout << "[GENEROWANIE] Obliczanie oswietlenia..." << std::endl;
     const float MAX_EDGE = g_Config.MaxTriangleEdge;
     std::vector<TriangleSortInfo> sortedTris; sortedTris.reserve(d.triangles.size() / 3);
 
