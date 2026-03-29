@@ -28,7 +28,7 @@
 
 namespace fs = std::filesystem;
 
-const std::string PROG_VERSION = "v322.1";
+const std::string PROG_VERSION = "v322.2";
 
 struct GlobalConfig {
     double LimitNMT1 = 150.0;       
@@ -112,6 +112,38 @@ struct TrackSegment {
 struct TriangleSortInfo {
     size_t v1, v2, v3;
     double cx, cz;
+};
+
+// -----------------------------------------------------------
+// Klasa dla formatu E3D 
+// -----------------------------------------------------------
+struct E3DChunkWriter {
+    std::vector<uint8_t> data;
+
+    void writeID(const char* id) { data.insert(data.end(), id, id + 4); }
+    
+    void writeU32(uint32_t val) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(&val);
+        data.insert(data.end(), p, p + 4);
+    }
+    
+    void writeI32(int32_t val) { writeU32(static_cast<uint32_t>(val)); }
+    
+    void writeF32(float val) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(&val);
+        data.insert(data.end(), p, p + 4);
+    }
+    
+    void writeZeroes(size_t count) { data.insert(data.end(), count, 0); }
+    
+    void pad() { while (data.size() % 4 != 0) data.push_back(0); }
+    
+    void finalizeLength() {
+        if (data.size() >= 8) {
+            uint32_t size = static_cast<uint32_t>(data.size());
+            std::memcpy(&data[4], &size, 4);
+        }
+    }
 };
 
 std::string Trim(const std::string& str) {
@@ -344,7 +376,8 @@ void PrintConfig() {
     std::cout << "  Pliki SCN      : " << g_Config.ScnFiles.size() << std::endl;
     std::cout << "  Katalogi NMT1  : " << g_Config.DirNMT.size() << std::endl;
     std::cout << "  Plik NMT100    : " << g_Config.FileNMT100 << std::endl;
-    std::cout << "  Wyjscie SCM    : (Katalog Glowny) " << g_Config.OutputSCM << std::endl;
+    std::cout << "  Wyjscie SCM    : " << (g_Config.ExportSCM ? g_Config.OutputSCM : "Wylaczone") << std::endl;
+    std::cout << "  Wyjscie E3D    : " << (g_Config.ExportE3D ? g_Config.OutputE3D : "Wylaczone") << std::endl;
     std::cout << "----------------------------------------\n";
 }
 
@@ -454,7 +487,7 @@ void LoadTracksFromSCN_Global(ScnInfo& sceneInfo, int sceneIdx, std::vector<Trac
 }
 
 void FlagGhostTracks(std::vector<TrackSegment>& tracks) {
-    std::cout << "[ANALIZA] Wykrywanie torow na wiaduktach/mostach i w tunelach..." << std::endl;
+    std::cout << "[ANALIZA] Wykrywanie torow na wiaduktach/mostach i tuneli..." << std::endl;
     std::vector<TrackSegment> bridges;
     for (const auto& t : tracks) {
         if (t.isBridge) bridges.push_back(t);
@@ -485,7 +518,7 @@ void FlagGhostTracks(std::vector<TrackSegment>& tracks) {
             }
         }
     }
-    std::cout << " -> Zablokowano " << ghosts << " odcinkow torow mostow/tuneli." << std::endl;
+    std::cout << " -> Zablokowano " << ghosts << " odcinkow torow mostow/wiaduktow i tuneli." << std::endl;
 }
 
 void LoadNMT1_DynamicLOD(const std::vector<std::string>& folderPaths, std::vector<TerrainPoint>& outPoints, double masterEast, double masterNorth, const std::vector<TrackSegment>& tracks) {
@@ -588,7 +621,7 @@ void LoadNMT1_DynamicLOD(const std::vector<std::string>& folderPaths, std::vecto
     for (auto& w : workers) w.join();
     for (auto& buf : threadBuffers) outPoints.insert(outPoints.end(), buf.begin(), buf.end());
     
-    std::cout << " -> Zaladowano " << outPoints.size() - startPointsSize << " aktywnych punktow NMT1 z siatki LOD." << std::endl;
+    std::cout << " -> Zaladowano " << outPoints.size() - startPointsSize << " punktow NMT1 z siatki LOD." << std::endl;
 }
 
 void LoadNMT100_TXT(const std::string& filename, std::vector<TerrainPoint>& points, double masterEast, double masterNorth) {
@@ -639,7 +672,6 @@ void ProcessAndFilterTerrainInRAM(std::vector<TerrainPoint>& points, const std::
                 double d = MathUtils::GetDistanceToSegment(pt.pos, *trk, trkY);
                 if (d < distToAnyTrack) distToAnyTrack = d;
                 
-                // Namierzanie najbliższego wiaduktu
                 if (trk->isBridge || trk->isTunnel) {
                     if (d < minDistBridge) { minDistBridge = d; nearestBridge = trk; }
                 }
@@ -658,11 +690,9 @@ void ProcessAndFilterTerrainInRAM(std::vector<TerrainPoint>& points, const std::
                 }
             }
 
-            // KLUCZOWA POPRAWKA (Przywrócenie blokady z v278)
             bool killPoint = false;
             if (nearestBridge != nullptr && minDistBridge <= 12.0 && pt.isNMT1) {
                 double bY; MathUtils::GetDistanceToSegment(pt.pos, *nearestBridge, bY);
-                // Niszczymy uderzenia lasera, które zawiesiły się na konstrukcji mostu.
                 if (pt.pos.y > bY - 2.5) { killPoint = true; }
             }
 
@@ -700,7 +730,7 @@ void ProcessAndFilterTerrainInRAM(std::vector<TerrainPoint>& points, const std::
 }
 
 void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vector<TerrainPoint>& points) {
-    std::cout << "[GENEROWANIE] Obliczanie fizycznych nasypow pod torami..." << std::endl;
+    std::cout << "[GENEROWANIE] Obliczanie ow pod torami..." << std::endl;
     SpatialGrid<150> grid; grid.Build(tracks);
     std::vector<TerrainPoint> newPoints;
     const double OFFSET_XZ = g_Config.EmbankmentWidth;
@@ -770,7 +800,7 @@ void RemoveDuplicates(std::vector<TerrainPoint>& points) {
 }
 
 void TriangulateAndExportSingle(std::vector<TerrainPoint>& points) {
-    std::cout << "[GENEROWANIE] Globalna Triangulacja Delaunaya..." << std::endl;
+    std::cout << "[GENEROWANIE] Triangulacja Delaunaya..." << std::endl;
     std::vector<double> coords; coords.reserve(points.size() * 2);
     for (const auto& p : points) { coords.push_back(p.pos.x); coords.push_back(p.pos.z); }
     delaunator::Delaunator d(coords);
@@ -819,6 +849,64 @@ void TriangulateAndExportSingle(std::vector<TerrainPoint>& points) {
         }
         if (g_Config.ProgressMode != 0) std::cout << std::endl;
         out.close();
+    }
+
+    // BLOK EKSPORTU DO FORMATU .e3d
+    if (g_Config.ExportE3D) {
+        std::cout << "[EKSPORT E3D] Plik: " << g_Config.OutputE3D << "..." << std::endl;
+        E3DChunkWriter tex0, nam0, vnt0, idx4, sub0, e3d0;
+        
+        tex0.writeID("TEX0"); tex0.writeU32(0); tex0.data.push_back(0); 
+        std::string tName = "grass"; tex0.data.insert(tex0.data.end(), tName.begin(), tName.end()); 
+        tex0.data.push_back(0); tex0.pad(); tex0.finalizeLength();
+        
+        nam0.writeID("NAM0"); nam0.writeU32(0); 
+        std::string sName = "teren"; nam0.data.insert(nam0.data.end(), sName.begin(), sName.end()); 
+        nam0.data.push_back(0); nam0.pad(); nam0.finalizeLength();
+        
+        vnt0.writeID("VNT0"); vnt0.writeU32(0);
+        for (const auto& p : points) { 
+            vnt0.writeF32(static_cast<float>(p.pos.x)); 
+            vnt0.writeF32(static_cast<float>(p.pos.y)); 
+            vnt0.writeF32(static_cast<float>(p.pos.z)); 
+            vnt0.writeF32(static_cast<float>(p.normal.x)); 
+            vnt0.writeF32(static_cast<float>(p.normal.y)); 
+            vnt0.writeF32(static_cast<float>(p.normal.z)); 
+            vnt0.writeF32(static_cast<float>(p.pos.x * 0.04)); 
+            vnt0.writeF32(static_cast<float>(p.pos.z * 0.04)); 
+        }
+        vnt0.pad(); vnt0.finalizeLength();
+        
+        idx4.writeID("IDX4"); idx4.writeU32(0);
+        for (const auto& t : sortedTris) { 
+            idx4.writeU32(static_cast<uint32_t>(t.v1)); 
+            idx4.writeU32(static_cast<uint32_t>(t.v2)); 
+            idx4.writeU32(static_cast<uint32_t>(t.v3)); 
+        }
+        idx4.pad(); idx4.finalizeLength();
+        
+        sub0.writeID("SUB0"); sub0.writeU32(0); sub0.writeI32(-1); sub0.writeI32(-1); sub0.writeI32(4); sub0.writeI32(0); 
+        sub0.writeI32(0); sub0.writeI32(16); sub0.writeI32(-1); sub0.writeI32(static_cast<int32_t>(points.size())); 
+        sub0.writeI32(0); sub0.writeI32(1); sub0.writeF32(0.0f); sub0.writeF32(0.0f); sub0.writeF32(0); sub0.writeF32(0); 
+        sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f); 
+        sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); 
+        sub0.writeF32(0); sub0.writeF32(1.0f); sub0.writeF32(100000000.0f); sub0.writeF32(0.0f); sub0.writeZeroes(32); 
+        sub0.writeI32(static_cast<int32_t>(sortedTris.size() * 3)); sub0.writeI32(0); sub0.writeF32(1.0f); sub0.writeZeroes(88); 
+        sub0.finalizeLength();
+        
+        e3d0.writeID("E3D0"); 
+        e3d0.writeU32(8 + static_cast<uint32_t>(sub0.data.size() + vnt0.data.size() + idx4.data.size() + tex0.data.size() + nam0.data.size())); 
+        e3d0.data.insert(e3d0.data.end(), sub0.data.begin(), sub0.data.end()); 
+        e3d0.data.insert(e3d0.data.end(), vnt0.data.begin(), vnt0.data.end()); 
+        e3d0.data.insert(e3d0.data.end(), idx4.data.begin(), idx4.data.end()); 
+        e3d0.data.insert(e3d0.data.end(), tex0.data.begin(), tex0.data.end()); 
+        e3d0.data.insert(e3d0.data.end(), nam0.data.begin(), nam0.data.end());
+        
+        std::ofstream file(g_Config.OutputE3D, std::ios::binary); 
+        file.write(reinterpret_cast<const char*>(e3d0.data.data()), e3d0.data.size()); 
+        file.close(); 
+        
+        std::cout << " -> Zapisano binarny plik E3D. Rozmiar: " << std::fixed << std::setprecision(1) << (e3d0.data.size() / 1024.0 / 1024.0) << " MB." << std::endl;
     }
 }
 
