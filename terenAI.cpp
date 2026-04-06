@@ -28,7 +28,7 @@
 
 namespace fs = std::filesystem;
 
-const std::string PROG_VERSION = "v322.2";
+const std::string PROG_VERSION = "v323.8";
 
 struct GlobalConfig {
     double LimitNMT1 = 150.0;       
@@ -51,6 +51,10 @@ struct GlobalConfig {
     double MinPointDist = 1.0;     
     double MergeClosePoints = 0.15; 
 
+    // Konfiguracja wiaduktow
+    double BridgeHoleRadius = 5.0; 
+    double BridgeClearance = 3.5;  
+
     std::vector<std::string> DirNMT; 
     std::string FileNMT100 = "NMT100.txt";
     std::vector<std::string> ScnFiles; 
@@ -59,6 +63,8 @@ struct GlobalConfig {
     std::string OutputSCM = "teren.scm";
     bool ExportE3D = false;
     std::string OutputE3D = "teren.e3d";
+    double E3DTileSize = 1000.0; 
+    double E3DMaxDistance = 50000.0; 
 
     int CpuUsagePercent = 80;
     int ProgressMode = 2; 
@@ -345,6 +351,10 @@ void LoadIniConfig(const std::string& filename) {
             else if (key == "OutputSCM") g_Config.OutputSCM = val;
             else if (key == "ExportE3D") g_Config.ExportE3D = (val == "1" || val == "true" || val == "TRUE");
             else if (key == "OutputE3D") g_Config.OutputE3D = val;
+            else if (key == "E3DTileSize") g_Config.E3DTileSize = std::stod(val);
+            else if (key == "E3DMaxDistance") g_Config.E3DMaxDistance = std::stod(val);
+            else if (key == "BridgeHoleRadius") g_Config.BridgeHoleRadius = std::stod(val);
+            else if (key == "BridgeClearance") g_Config.BridgeClearance = std::stod(val);
             else if (key == "LimitNMT1") g_Config.LimitNMT1 = std::stod(val);
             else if (key == "LimitNMT100") g_Config.LimitNMT100Max = std::stod(val); 
             else if (key == "SnapDist") g_Config.SnapDist = std::stod(val);
@@ -377,7 +387,7 @@ void PrintConfig() {
     std::cout << "  Katalogi NMT1  : " << g_Config.DirNMT.size() << std::endl;
     std::cout << "  Plik NMT100    : " << g_Config.FileNMT100 << std::endl;
     std::cout << "  Wyjscie SCM    : " << (g_Config.ExportSCM ? g_Config.OutputSCM : "Wylaczone") << std::endl;
-    std::cout << "  Wyjscie E3D    : " << (g_Config.ExportE3D ? g_Config.OutputE3D : "Wylaczone") << std::endl;
+    std::cout << "  Wyjscie E3D    : " << (g_Config.ExportE3D ? g_Config.OutputE3D + " (Kafle: " + std::to_string((int)g_Config.E3DTileSize) + "m, Widocznosc: " + std::to_string((int)g_Config.E3DMaxDistance) + "m)" : "Wylaczone") << std::endl;
     std::cout << "----------------------------------------\n";
 }
 
@@ -691,9 +701,9 @@ void ProcessAndFilterTerrainInRAM(std::vector<TerrainPoint>& points, const std::
             }
 
             bool killPoint = false;
-            if (nearestBridge != nullptr && minDistBridge <= 12.0 && pt.isNMT1) {
+            if (nearestBridge != nullptr && minDistBridge <= g_Config.BridgeHoleRadius && pt.isNMT1) {
                 double bY; MathUtils::GetDistanceToSegment(pt.pos, *nearestBridge, bY);
-                if (pt.pos.y > bY - 2.5) { killPoint = true; }
+                if (pt.pos.y > bY - g_Config.BridgeClearance) { killPoint = true; }
             }
 
             if (killPoint) {
@@ -730,7 +740,7 @@ void ProcessAndFilterTerrainInRAM(std::vector<TerrainPoint>& points, const std::
 }
 
 void GenerateEmbankmentPoints(const std::vector<TrackSegment>& tracks, std::vector<TerrainPoint>& points) {
-    std::cout << "[GENEROWANIE] Obliczanie nasypow pod torami..." << std::endl;
+    std::cout << "[GENEROWANIE] Obliczanie fizycznych nasypow pod torami..." << std::endl;
     SpatialGrid<150> grid; grid.Build(tracks);
     std::vector<TerrainPoint> newPoints;
     const double OFFSET_XZ = g_Config.EmbankmentWidth;
@@ -851,62 +861,132 @@ void TriangulateAndExportSingle(std::vector<TerrainPoint>& points) {
         out.close();
     }
 
-    // BLOK EKSPORTU DO FORMATU .e3d
     if (g_Config.ExportE3D) {
-        std::cout << "[EKSPORT E3D] Plik: " << g_Config.OutputE3D << "..." << std::endl;
-        E3DChunkWriter tex0, nam0, vnt0, idx4, sub0, e3d0;
+        std::cout << "[EKSPORT E3D] Podzial terenu na kafle " << g_Config.E3DTileSize << "x" << g_Config.E3DTileSize << "m..." << std::endl;
         
-        tex0.writeID("TEX0"); tex0.writeU32(0); tex0.data.push_back(0); 
-        std::string tName = "grass"; tex0.data.insert(tex0.data.end(), tName.begin(), tName.end()); 
-        tex0.data.push_back(0); tex0.pad(); tex0.finalizeLength();
+        double tileSize = g_Config.E3DTileSize;
+        std::map<std::pair<int, int>, std::vector<TriangleSortInfo>> tiles;
         
-        nam0.writeID("NAM0"); nam0.writeU32(0); 
-        std::string sName = "teren"; nam0.data.insert(nam0.data.end(), sName.begin(), sName.end()); 
-        nam0.data.push_back(0); nam0.pad(); nam0.finalizeLength();
-        
-        vnt0.writeID("VNT0"); vnt0.writeU32(0);
-        for (const auto& p : points) { 
-            vnt0.writeF32(static_cast<float>(p.pos.x)); 
-            vnt0.writeF32(static_cast<float>(p.pos.y)); 
-            vnt0.writeF32(static_cast<float>(p.pos.z)); 
-            vnt0.writeF32(static_cast<float>(p.normal.x)); 
-            vnt0.writeF32(static_cast<float>(p.normal.y)); 
-            vnt0.writeF32(static_cast<float>(p.normal.z)); 
-            vnt0.writeF32(static_cast<float>(p.pos.x * 0.04)); 
-            vnt0.writeF32(static_cast<float>(p.pos.z * 0.04)); 
+        for (const auto& t : sortedTris) {
+            int tx = static_cast<int>(std::floor(t.cx / tileSize));
+            int tz = static_cast<int>(std::floor(t.cz / tileSize));
+            tiles[{tx, tz}].push_back(t);
         }
-        vnt0.pad(); vnt0.finalizeLength();
-        
-        idx4.writeID("IDX4"); idx4.writeU32(0);
-        for (const auto& t : sortedTris) { 
-            idx4.writeU32(static_cast<uint32_t>(t.v1)); 
-            idx4.writeU32(static_cast<uint32_t>(t.v2)); 
-            idx4.writeU32(static_cast<uint32_t>(t.v3)); 
+
+        std::string baseE3D = g_Config.OutputE3D;
+        if (baseE3D.length() > 4 && baseE3D.substr(baseE3D.length() - 4) == ".e3d") {
+            baseE3D = baseE3D.substr(0, baseE3D.length() - 4);
         }
-        idx4.pad(); idx4.finalizeLength();
         
-        sub0.writeID("SUB0"); sub0.writeU32(0); sub0.writeI32(-1); sub0.writeI32(-1); sub0.writeI32(4); sub0.writeI32(0); 
-        sub0.writeI32(0); sub0.writeI32(16); sub0.writeI32(-1); sub0.writeI32(static_cast<int32_t>(points.size())); 
-        sub0.writeI32(0); sub0.writeI32(1); sub0.writeF32(0.0f); sub0.writeF32(0.0f); sub0.writeF32(0); sub0.writeF32(0); 
-        sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f); 
-        sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); 
-        sub0.writeF32(0); sub0.writeF32(1.0f); sub0.writeF32(100000000.0f); sub0.writeF32(0.0f); sub0.writeZeroes(32); 
-        sub0.writeI32(static_cast<int32_t>(sortedTris.size() * 3)); sub0.writeI32(0); sub0.writeF32(1.0f); sub0.writeZeroes(88); 
-        sub0.finalizeLength();
+        std::string masterScnPath = baseE3D + "_e3d.scm";
+        std::ofstream masterScn(masterScnPath);
         
-        e3d0.writeID("E3D0"); 
-        e3d0.writeU32(8 + static_cast<uint32_t>(sub0.data.size() + vnt0.data.size() + idx4.data.size() + tex0.data.size() + nam0.data.size())); 
-        e3d0.data.insert(e3d0.data.end(), sub0.data.begin(), sub0.data.end()); 
-        e3d0.data.insert(e3d0.data.end(), vnt0.data.begin(), vnt0.data.end()); 
-        e3d0.data.insert(e3d0.data.end(), idx4.data.begin(), idx4.data.end()); 
-        e3d0.data.insert(e3d0.data.end(), tex0.data.begin(), tex0.data.end()); 
-        e3d0.data.insert(e3d0.data.end(), nam0.data.begin(), nam0.data.end());
+        auto t_now = std::time(nullptr);
+        auto tm_now = *std::localtime(&t_now);
+        masterScn << "// Generated by TerenAI " << PROG_VERSION << " | Data: " << std::put_time(&tm_now, "%Y-%m-%d %H:%M:%S") << "\n";
+        masterScn << "// Zaladuj plik np. poleceniem \"include " << masterScnPath << " end\"\n\n";
+
+        std::string outDir = "kafle_teren";
+        if (!fs::exists(outDir)) {
+            fs::create_directories(outDir);
+        }
+
+        int tileCounter = 0;
+        size_t totalTiles = tiles.size();
         
-        std::ofstream file(g_Config.OutputE3D, std::ios::binary); 
-        file.write(reinterpret_cast<const char*>(e3d0.data.data()), e3d0.data.size()); 
-        file.close(); 
+        float maxDistSq = static_cast<float>(g_Config.E3DMaxDistance * g_Config.E3DMaxDistance);
         
-        std::cout << " -> Zapisano binarny plik E3D. Rozmiar: " << std::fixed << std::setprecision(1) << (e3d0.data.size() / 1024.0 / 1024.0) << " MB." << std::endl;
+        for (auto& kv : tiles) {
+            int tx = kv.first.first;
+            int tz = kv.first.second;
+            auto& tileTris = kv.second;
+
+            double centerPosX = tx * tileSize + tileSize * 0.5;
+            double centerPosZ = tz * tileSize + tileSize * 0.5;
+
+            std::unordered_map<size_t, size_t> globalToLocal;
+            std::vector<TerrainPoint> localPoints;
+
+            for (const auto& t : tileTris) {
+                size_t idx[3] = {t.v1, t.v2, t.v3};
+                for (int v = 0; v < 3; v++) {
+                    if (globalToLocal.find(idx[v]) == globalToLocal.end()) {
+                        globalToLocal[idx[v]] = localPoints.size();
+                        TerrainPoint lp = points[idx[v]];
+                        lp.pos.x -= centerPosX;
+                        lp.pos.z -= centerPosZ;
+                        localPoints.push_back(lp);
+                    }
+                }
+            }
+
+            std::string tileFileName = baseE3D + "_" + std::to_string(tx) + "_" + std::to_string(tz) + ".e3d";
+            std::string fullTilePath = outDir + "/" + tileFileName;
+
+            E3DChunkWriter tex0, nam0, vnt0, idx4, sub0, e3d0;
+            
+            tex0.writeID("TEX0"); tex0.writeU32(0); tex0.data.push_back(0); 
+            std::string tName = "grass"; tex0.data.insert(tex0.data.end(), tName.begin(), tName.end()); 
+            tex0.data.push_back(0); tex0.pad(); tex0.finalizeLength();
+            
+            nam0.writeID("NAM0"); nam0.writeU32(0); 
+            std::string sName = "teren_" + std::to_string(tx) + "_" + std::to_string(tz); 
+            nam0.data.insert(nam0.data.end(), sName.begin(), sName.end()); 
+            nam0.data.push_back(0); nam0.pad(); nam0.finalizeLength();
+            
+            vnt0.writeID("VNT0"); vnt0.writeU32(0);
+            for (const auto& p : localPoints) { 
+                vnt0.writeF32(static_cast<float>(p.pos.x)); 
+                vnt0.writeF32(static_cast<float>(p.pos.y)); 
+                vnt0.writeF32(static_cast<float>(p.pos.z)); 
+                vnt0.writeF32(static_cast<float>(p.normal.x)); 
+                vnt0.writeF32(static_cast<float>(p.normal.y)); 
+                vnt0.writeF32(static_cast<float>(p.normal.z)); 
+                vnt0.writeF32(static_cast<float>((p.pos.x + centerPosX) * 0.04)); 
+                vnt0.writeF32(static_cast<float>((p.pos.z + centerPosZ) * 0.04)); 
+            }
+            vnt0.pad(); vnt0.finalizeLength();
+            
+            idx4.writeID("IDX4"); idx4.writeU32(0);
+            for (const auto& t : tileTris) { 
+                idx4.writeU32(static_cast<uint32_t>(globalToLocal[t.v1])); 
+                idx4.writeU32(static_cast<uint32_t>(globalToLocal[t.v2])); 
+                idx4.writeU32(static_cast<uint32_t>(globalToLocal[t.v3])); 
+            }
+            idx4.pad(); idx4.finalizeLength();
+            
+            sub0.writeID("SUB0"); sub0.writeU32(0); sub0.writeI32(-1); sub0.writeI32(-1); sub0.writeI32(4); sub0.writeI32(0); 
+            sub0.writeI32(0); sub0.writeI32(16); sub0.writeI32(-1); sub0.writeI32(static_cast<int32_t>(localPoints.size())); 
+            sub0.writeI32(0); sub0.writeI32(1); sub0.writeF32(0.0f); sub0.writeF32(0.0f); sub0.writeF32(0); sub0.writeF32(0); 
+            sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f); sub0.writeF32(1.0f); 
+            sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); sub0.writeF32(0); 
+            sub0.writeF32(0); sub0.writeF32(1.0f); sub0.writeF32(maxDistSq); sub0.writeF32(0.0f); sub0.writeZeroes(32); 
+            sub0.writeI32(static_cast<int32_t>(tileTris.size() * 3)); sub0.writeI32(0); sub0.writeF32(1.0f); sub0.writeZeroes(88); 
+            sub0.finalizeLength();
+            
+            e3d0.writeID("E3D0"); 
+            e3d0.writeU32(8 + static_cast<uint32_t>(sub0.data.size() + vnt0.data.size() + idx4.data.size() + tex0.data.size() + nam0.data.size())); 
+            e3d0.data.insert(e3d0.data.end(), sub0.data.begin(), sub0.data.end()); 
+            e3d0.data.insert(e3d0.data.end(), vnt0.data.begin(), vnt0.data.end()); 
+            e3d0.data.insert(e3d0.data.end(), idx4.data.begin(), idx4.data.end()); 
+            e3d0.data.insert(e3d0.data.end(), tex0.data.begin(), tex0.data.end()); 
+            e3d0.data.insert(e3d0.data.end(), nam0.data.begin(), nam0.data.end());
+            
+            std::ofstream file(fullTilePath, std::ios::binary); 
+            file.write(reinterpret_cast<const char*>(e3d0.data.data()), e3d0.data.size()); 
+            file.close(); 
+            
+            masterScn << "node -1 0 " << sName << " model " 
+                      << std::fixed << std::setprecision(2) << centerPosX << " 0.0 " << centerPosZ 
+                      << " 0.0 katalog/" << outDir << "/" << tileFileName << " none endmodel\n";
+            
+            tileCounter++;
+            if (tileCounter % 10 == 0 || tileCounter == totalTiles) ShowProgress(tileCounter, totalTiles, "[EKSPORT E3D] Zapis kafli");
+        }
+        if (g_Config.ProgressMode != 0) std::cout << std::endl;
+        masterScn.close();
+        
+        std::cout << " -> Zapisano " << totalTiles << " plikow E3D w katalogu '" << outDir << "' oraz plik zbierajacy: " << masterScnPath << std::endl;
     }
 }
 
